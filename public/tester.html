@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bảng Test Game</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f0f2f5; max-width: 500px; margin: 0 auto; }
+        .box { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        input, button { width: 100%; padding: 12px; margin-top: 10px; box-sizing: border-box; border-radius: 5px; border: 1px solid #ccc; font-size: 16px; }
+        button { background: #007bff; color: white; border: none; cursor: pointer; font-weight: bold; }
+        button:active { background: #0056b3; }
+        .btn-gift { background: #ff4757; }
+        .btn-gift:active { background: #ff6b81; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h3>👤 Thông tin người test</h3>
+        <input type="text" id="userName" placeholder="Nhập tên của bạn (Vd: Tuấn)" value="Tester">
+    </div>
+
+    <div class="box">
+        <h3>💬 Gửi Chat (Vào lớp / Trả lời)</h3>
+        <input type="text" id="chatText" placeholder="Nhập chữ 'vao' hoặc 'đáp án số'">
+        <button onclick="sendChat()">Gửi Chat</button>
+    </div>
+
+    <div class="box">
+        <h3>🎁 Tặng Quà (Kích hoạt kỹ năng)</h3>
+        <div class="grid">
+            <button class="btn-gift" onclick="sendGift('Hoa hồng', 1)">1 Xu (Vào bàn)</button>
+            <button class="btn-gift" onclick="sendGift('Trà đá', 2)">2 Xu (Phao / Gõ thước)</button>
+            <button class="btn-gift" onclick="sendGift('Kính lúp', 5)">5 Xu (Máy tính / x1.8)</button>
+            <button class="btn-gift" onclick="sendGift('Gối ngủ', 10)">10 Xu (Đơ thầy / Soi 4 bàn)</button>
+            <button class="btn-gift" onclick="sendGift('Tai nghe', 20)">20 Xu (Auto giải)</button>
+            <button class="btn-gift" onclick="sendGift('Khiên', 50)">50 Xu (Khiên / Quét Laser)</button>
+        </div>
+        <button class="btn-gift" style="background:#ffa502;" onclick="sendGift('Corgi', 99)">99 Xu (Cướp quyền Giám thị)</button>
+        <button class="btn-gift" style="background:#2ed573;" onclick="sendGift('Vương miện', 100)">100+ Xu (Đuổi toàn bộ)</button>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        // Tạo ID ngẫu nhiên cho mỗi người mở trang web này để không bị trùng nhau
+        const userId = 'user_' + Math.floor(Math.random() * 10000); 
+
+        function sendChat() {
+            const name = document.getElementById('userName').value || 'Vô danh';
+            const text = document.getElementById('chatText').value;
+            if (!text) return alert('Hãy nhập nội dung chat!');
+            
+            socket.emit('simulate_chat', {
+                userId: userId,
+                name: name,
+                avatar: '',
+                text: text
+            });
+            document.getElementById('chatText').value = ''; // Xóa chữ sau khi gửi
+        }
+
+        function sendGift(giftName, coins) {
+            const name = document.getElementById('userName').value || 'Vô danh';
+            socket.emit('simulate_gift', {
+                userId: userId,
+                name: name,
+                avatar: '',
+                giftName: giftName,
+                totalCoins: coins
+            });
+        }
+    </script>
+</body>
+</html>

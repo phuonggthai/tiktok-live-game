@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Lớp Học TikTok Live</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #111;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            background-color: #cfb07d;
+            max-height: 100vh;
+            max-width: 100vw;
+            aspect-ratio: 9/16;
+            box-shadow: 0 0 25px rgba(0,0,0,0.85);
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="1080" height="1920"></canvas>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const socket = io();
+
+    const GAME_WIDTH = 1080;
+    const GAME_HEIGHT = 1920;
+
+    // --- HỆ THỐNG TỌA ĐỘ LƯỚI 10 HÀNG x 10 CỘT (ĐẨY XUỐNG DƯỚI & SÁT NHAU HƠN) ---
+    const colX = [16, 108, 200, 356, 448, 540, 632, 788, 880, 972];
+    const rowY = [];
+    const startY = 815, gapY = 106; // Dịch xuống dưới màn hình và thu hẹp khoảng cách hàng
+    for (let r = 0; r < 10; r++) {
+        rowY.push(startY + r * gapY);
+    }
+
+    // Hệ thống đường đi dọc và ngang (đảm bảo Giám thị đi đúng khe trống giữa các bàn)
+    const verticalAisles = [316, 748];
+    const horizontalAisles = [735]; // Hành lang ngang phía trên hàng 1
+    for (let r = 0; r < 10; r++) {
+        horizontalAisles.push(rowY[r] + 62); // Khoảng trống ngang giữa các hàng bàn
+    }
+
+    // --- TRẠNG THÁI GAME ---
+    let desks = [];
+    let students = {};
+    let queue = [];
+    let mathProblem = { text: '', answer: 0, timeLeft: 15 };
+    let lastTime = Date.now();
+    let globalStunTimer = 0;
+    let floatingTexts = [];
+    let visualEffects = [];
+    let fanAngle = 0;
+
+    // Khởi tạo 100 bàn học (10 hàng x 10 cột)
+    const deskW = 76, deskH = 26;
+    for (let r = 0; r < 10; r++) {
+        for (let c = 0; c < 10; c++) {
+            desks.push({
+                row: r,
+                col: c,
+                x: colX[c],
+                y: rowY[r],
+                width: deskW,
+                height: deskH,
+                occupantId: null
+            });
+        }
+    }
+
+    // 2 Vị trí Giám thị
+    let invigilators = [
+        {
+            slot: 0,
+            active: false,
+            id: null,
+            name: 'Trống (Cần >=99 Xu)',
+            avatar: null,
+            suitColor: '#2e7d32',
+            x: verticalAisles[0],
+            y: 735,
+            targetX: verticalAisles[0],
+            targetY: 735,
+            speed: 115,
+            fastTimer: 0,
+            zoneTimer: 0,
+            zoneDesks: [],
+            walkCycle: 0
+        },
+        {
+            slot: 1,
+            active: false,
+            id: null,
+            name: 'Trống (Cần >=99 Xu)',
+            avatar: null,
+            suitColor: '#1565c0',
+            x: verticalAisles[1],
+            y: rowY[1] + 62,
+            targetX: verticalAisles[1],
+            targetY: rowY[1] + 62,
+            speed: 115,
+            fastTimer: 0,
+            zoneTimer: 0,
+            zoneDesks: [],
+            walkCycle: 0
+        }
+    ];
+
+    // --- HỆ THỐNG LOAD ẢNH AVATAR ---
+    const imageCache = {};
+    const avatarColors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12', '#1abc9c', '#e67e22'];
+    function getColorByName(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        return avatarColors[Math.abs(hash) % avatarColors.length];
+    }
+
+    function drawAvatar(url, name, x, y, radius, borderColor = '#ffffff') {
+        if (url && !imageCache[url]) {
+            let img = new Image();
+            img.src = url;
+            imageCache[url] = { img: img, loaded: false, error: false };
+            img.onload = () => { imageCache[url].loaded = true; };
+            img.onerror = () => { imageCache[url].error = true; };
+        }
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.clip();
+
+        if (url && imageCache[url] && imageCache[url].loaded && !imageCache[url].error) {
+            try {
+                ctx.drawImage(imageCache[url].img, x - radius, y - radius, radius * 2, radius * 2);
+            } catch (e) {
+                drawFallbackAvatar(name, x, y, radius);
+            }
+        } else {
+            drawFallbackAvatar(name, x, y, radius);
+        }
+        ctx.restore();
+
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = borderColor;
+        ctx.stroke();
+    }
+
+    function drawFallbackAvatar(name, x, y, radius) {
+        ctx.fillStyle = getColorByName(name || 'HS');
+        ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${Math.floor(radius * 0.95)}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        let initial = (name && name.length > 0) ? name.charAt(0).toUpperCase() : '?';
+        ctx.fillText(initial, x, y);
+    }
+
+    // --- BỘ TẠO CÂU HỎI TOÁN RANDOM 6 DẠNG ĐỀ ---
+    function generateMath() {
+        let text = '';
+        let answer = 0;
+        const type = Math.floor(Math.random() * 6);
+
+        function generateAddSubN(count) {
+            let nums = [];
+            let ops = [];
+            let current = Math.floor(Math.random() * 8) + 2;
+            nums.push(current);
+
+            for (let i = 1; i < count; i++) {
+                let nextNum = Math.floor(Math.random() * 9) + 1;
+                let canSub = current >= nextNum;
+                let isPlus = canSub ? (Math.random() > 0.5) : true;
+
+                if (isPlus) {
+                    ops.push('+');
+                    current += nextNum;
+                } else {
+                    ops.push('-');
+                    current -= nextNum;
+                }
+                nums.push(nextNum);
+            }
+
+            let str = `${nums[0]}`;
+            for (let i = 0; i < ops.length; i++) {
+                str += ` ${ops[i]} ${nums[i + 1]}`;
+            }
+            return { text: str + ' = ?', answer: current };
+        }
+
+        switch (type) {
+            case 0: {
+                const res = generateAddSubN(3);
+                text = res.text; answer = res.answer;
+                break;
+            }
+            case 1: {
+                const res = generateAddSubN(4);
+                text = res.text; answer = res.answer;
+                break;
+            }
+            case 2: {
+                const res = generateAddSubN(5);
+                text = res.text; answer = res.answer;
+                break;
+            }
+            case 3: {
+                let a = Math.floor(Math.random() * 90) + 10;
+                let b = Math.floor(Math.random() * 90) + 10;
+                if (Math.random() > 0.5) {
+                    text = `${a} + ${b} = ?`;
+                    answer = a + b;
+                } else {
+                    let big = Math.max(a, b);
+                    let small = Math.min(a, b);
+                    text = `${big} - ${small} = ?`;
+                    answer = big - small;
+                }
+                break;
+            }
+            case 4: {
+                let isMul = Math.random() > 0.5;
+                if (isMul) {
+                    let a = Math.floor(Math.random() * 8) + 2;
+                    let b = Math.floor(Math.random() * 8) + 2;
+                    text = `${a} × ${b} = ?`;
+                    answer = a * b;
+                } else {
+                    let divisor = Math.floor(Math.random() * 8) + 2;
+                    let result = Math.floor(Math.random() * 8) + 2;
+                    let dividend = divisor * result;
+                    text = `${dividend} : ${divisor} = ?`;
+                    answer = result;
+                }
+                break;
+            }
+            case 5: {
+                let pattern = Math.floor(Math.random() * 2);
+                if (pattern === 0) {
+                    let a = Math.floor(Math.random() * 8) + 2;
+                    let b = Math.floor(Math.random() * 8) + 2;
+                    let c = Math.floor(Math.random() * 9) + 1;
+                    let mult = a * b;
+                    if (Math.random() > 0.5) {
+                        text = `${a} × ${b} + ${c} = ?`;
+                        answer = mult + c;
+                    } else {
+                        text = (mult >= c) ? `${a} × ${b} - ${c} = ?` : `${c} + ${a} × ${b} = ?`;
+                        answer = (mult >= c) ? (mult - c) : (c + mult);
+                    }
+                } else {
+                    let b = Math.floor(Math.random() * 7) + 2;
+                    let ansDiv = Math.floor(Math.random() * 8) + 2;
+                    let a = b * ansDiv;
+                    let c = Math.floor(Math.random() * 9) + 1;
+                    if (Math.random() > 0.5) {
+                        text = `${a} : ${b} + ${c} = ?`;
+                        answer = ansDiv + c;
+                    } else {
+                        if (ansDiv >= c) {
+                            text = `${a} : ${b} - ${c} = ?`;
+                            answer = ansDiv - c;
+                        } else {
+                            text = `${c} + ${a} : ${b} = ?`;
+                            answer = c + ansDiv;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        mathProblem.text = text;
+        mathProblem.answer = answer;
+        mathProblem.timeLeft = 15;
+
+        Object.values(students).forEach(s => {
+            if (s.autoSolveCount > 0) {
+                s.autoSolveCount--;
+                s.score += s.doublePoints ? 2 : 1;
+                let d = desks[s.deskIndex];
+                addFloatingText(d.x + d.width / 2, d.y, '+Điểm (Auto)', '#00ff00');
+            }
+        });
+    }
+    generateMath();
+
+    function addFloatingText(x, y, text, color) {
+        floatingTexts.push({ x, y, text, color, life: 2 });
+    }
+
+    const shirtColors = ['#3498db', '#e67e22', '#9b59b6', '#2ecc71', '#e74c3c', '#1abc9c', '#f1c40f'];
+
+    function assignDesk(user) {
+        if (students[user.userId]) return;
+        let emptyIndex = desks.findIndex(d => d.occupantId === null);
+        if (emptyIndex !== -1) {
+            students[user.userId] = {
+                id: user.userId,
+                name: user.name,
+                avatar: user.avatar,
+                score: 0,
+                deskIndex: emptyIndex,
+                shirtColor: shirtColors[emptyIndex % shirtColors.length],
+                shieldTimer: 0,
+                hintTimer: 0,
+                autoSolveCount: 0,
+                doublePoints: false,
+                isCheating: false
+            };
+            desks[emptyIndex].occupantId = user.userId;
+        } else {
+            if (!queue.find(u => u.userId === user.userId)) queue.push(user);
+        }
+    }
+
+    function kickStudent(userId, customMsg = 'BỊ ĐUỔI!') {
+        let student = students[userId];
+        if (student) {
+            let d = desks[student.deskIndex];
+            d.occupantId = null;
+            delete students[userId];
+            addFloatingText(d.x + d.width / 2, d.y, customMsg, '#ff2222');
+
+            if (queue.length > 0) {
+                let nextUser = queue.shift();
+                assignDesk(nextUser);
+            }
+        }
+    }
+
+    function pickNextWaypoint(inv) {
+        const onVertical = verticalAisles.some(vx => Math.abs(inv.x - vx) < 4);
+        const onHorizontal = horizontalAisles.some(hy => Math.abs(inv.y - hy) < 4);
+
+        if (onVertical && onHorizontal) {
+            if (Math.random() < 0.65) {
+                let nextH = horizontalAisles[Math.floor(Math.random() * horizontalAisles.length)];
+                inv.targetX = inv.x;
+                inv.targetY = nextH;
+            } else {
+                const horizontalStops = [60, 316, 530, 748, 990];
+                inv.targetX = horizontalStops[Math.floor(Math.random() * horizontalStops.length)];
+                inv.targetY = inv.y;
+            }
+        } else if (!onVertical) {
+            let nearestV = verticalAisles.reduce((prev, curr) =>
+                Math.abs(curr - inv.x) < Math.abs(prev - inv.x) ? curr : prev
+            );
+            inv.targetX = nearestV;
+            inv.targetY = inv.y;
+        } else {
+            let nextH = horizontalAisles[Math.floor(Math.random() * horizontalAisles.length)];
+            inv.targetX = inv.x;
+            inv.targetY = nextH;
+        }
+    }
+
+    function becomeInvigilator(user) {
+        if (students[user.userId]) {
+            let oldDesk = desks[students[user.userId].deskIndex];
+            oldDesk.occupantId = null;
+            delete students[user.userId];
+        }
+
+        let existingSlot = invigilators.findIndex(i => i.active && i.id === user.userId);
+        let slot = existingSlot !== -1 ? existingSlot : (!invigilators[0].active ? 0 : (!invigilators[1].active ? 1 : Math.floor(Math.random() * 2)));
+
+        let inv = invigilators[slot];
+        inv.active = true;
+        inv.id = user.userId;
+        inv.name = user.name;
+        inv.avatar = user.avatar;
+        pickNextWaypoint(inv);
+        addFloatingText(540, 560, `👑 ${user.name} nắm quyền GIÁM THỊ ${slot + 1}!`, '#00ffcc');
+    }
+
+    function select4NearestDesks(inv) {
+        let sorted = [...desks].sort((a, b) => {
+            let da = Math.hypot((a.x + a.width / 2) - inv.x, (a.y + a.height / 2) - inv.y);
+            let db = Math.hypot((b.x + b.width / 2) - inv.x, (b.y + b.height / 2) - inv.y);
+            return da - db;
+        });
+        return sorted.slice(0, 4).map(d => d.row * 10 + d.col);
+    }
+
+    // --- LẮNG NGHE SỰ KIỆN TỪ SERVER ---
+    socket.on('chat', data => {
+        if (data.text.toLowerCase() === 'vao') {
+            assignDesk(data);
+            return;
+        }
+
+        let student = students[data.userId];
+        if (student) {
+            let answerNum = parseInt(data.text);
+            if (!isNaN(answerNum)) {
+                let d = desks[student.deskIndex];
+                if (answerNum === mathProblem.answer) {
+                    student.score += student.doublePoints ? 2 : 1;
+                    addFloatingText(d.x + d.width / 2, d.y, '+1 Điểm', '#00ff00');
+                } else {
+                    addFloatingText(d.x + d.width / 2, d.y, 'SAI RỒI!', '#ff3333');
+                }
+            }
+        }
+    });
+
+    socket.on('gift', data => {
+        const coins = data.totalCoins;
+        let invig = invigilators.find(i => i.active && i.id === data.userId);
+
+        if (invig && coins >= 100) {
+            visualEffects.push({ type: 'strict_inspection', life: 1.5, maxLife: 1.5 });
+            addFloatingText(GAME_WIDTH / 2, 700, '🚨 ĐỢT KIỂM TRA GẮT! ĐUỔI TOÀN BỘ VI PHẠM!', '#ff1111');
+            Object.values(students).forEach(s => {
+                if (s.isCheating && s.shieldTimer <= 0) {
+                    kickStudent(s.id, 'TRƯỢT THI! (Bị đuổi)');
+                }
+            });
+            return;
+        }
+
+        if (!invig && coins >= 99) {
+            becomeInvigilator(data);
+            return;
+        }
+
+        if (invig) {
+            if (coins === 2) {
+                let candidates = Object.values(students).filter(s => s.hintTimer > 0 || s.isCheating);
+                if (candidates.length === 0) candidates = Object.values(students);
+
+                if (candidates.length > 0) {
+                    candidates.sort((a, b) => {
+                        let da = Math.hypot(desks[a.deskIndex].x - invig.x, desks[a.deskIndex].y - invig.y);
+                        let db = Math.hypot(desks[b.deskIndex].x - invig.x, desks[b.deskIndex].y - invig.y);
+                        return da - db;
+                    });
+                    let target = candidates[0];
+                    target.hintTimer *= 0.5;
+                    let d = desks[target.deskIndex];
+
+                    visualEffects.push({
+                        type: 'ruler_strike',
+                        x1: invig.x, y1: invig.y,
+                        x2: d.x + d.width / 2, y2: d.y + d.height / 2,
+                        life: 0.9, maxLife: 0.9
+                    });
+                    addFloatingText(d.x + d.width / 2, d.y, '📏 GÕ THƯỚC! (-50% TG Phao)', '#ff9f43');
+                } else {
+                    addFloatingText(invig.x, invig.y - 40, '📏 Gõ thước cảnh cáo!', '#ff9f43');
+                }
+            } else if (coins === 5) {
+                invig.fastTimer = 15;
+                addFloatingText(invig.x, invig.y - 40, '⚡ Tuần tra nhanh x1.8 (15s)', '#00ffcc');
+            } else if (coins === 10) {
+                invig.zoneTimer = 30;
+                invig.zoneDesks = select4NearestDesks(invig);
+                addFloatingText(invig.x, invig.y - 40, '🔦 Soi sáng vùng 4 bàn (30s)', '#ffeb3b');
+            } else if (coins === 50) {
+                let halfSide = invig.slot === 0 ? 'left' : 'right';
+                visualEffects.push({
+                    type: 'laser_cone',
+                    x: invig.x,
+                    y: invig.y,
+                    side: halfSide,
+                    life: 1.8,
+                    maxLife: 1.8
+                });
+                addFloatingText(invig.x, invig.y - 50, '🚨 QUÉT LASER NỬA PHÒNG!', '#ff3333');
+
+                Object.values(students).forEach(s => {
+                    let d = desks[s.deskIndex];
+                    let inHalfRoom = halfSide === 'left' ? (d.col < 5) : (d.col >= 5);
+                    if (inHalfRoom && s.isCheating && s.shieldTimer <= 0) {
+                        s.score = Math.max(0, s.score - 5);
+                        s.isCheating = false;
+                        s.hintTimer = 0;
+                        s.autoSolveCount = 0;
+                        addFloatingText(d.x + d.width / 2, d.y, '⚡ BỊ QUÉT LASER! (-5đ)', '#ff0000');
+                    }
+                });
+            }
+        } else {
+            if (coins === 1) assignDesk(data);
+            let student = students[data.userId];
+            if (!student) return;
+            let d = desks[student.deskIndex];
+
+            if (coins === 2) {
+                student.hintTimer = 35;
+                student.isCheating = true;
+                addFloatingText(d.x + d.width / 2, d.y, '📖 Mở phao thi (35s)', '#ffeb3b');
+            } else if (coins === 5) {
+                student.score += student.doublePoints ? 12 : 6;
+                student.isCheating = true;
+                addFloatingText(d.x + d.width / 2, d.y, '📱 Máy tính (+6đ)', '#ffff00');
+            } else if (coins === 10) {
+                globalStunTimer = 8;
+                addFloatingText(d.x + d.width / 2, d.y, '💤 Đánh lạc hướng Giám thị (8s)', '#00ffcc');
+            } else if (coins === 20) {
+                student.autoSolveCount = 3;
+                student.isCheating = true;
+                addFloatingText(d.x + d.width / 2, d.y, '🎧 Tra đáp án nhanh (3 câu)', '#00ff00');
+            } else if (coins === 50) {
+                student.shieldTimer = 25;
+                addFloatingText(d.x + d.width / 2, d.y, '🛡️ Khiên bảo vệ (25s)', '#00ffff');
+            }
+        }
+    });
+
+    // --- CẬP NHẬT LOGIC GAME ---
+    function update(dt) {
+        mathProblem.timeLeft -= dt;
+        if (mathProblem.timeLeft <= 0) generateMath();
+
+        if (globalStunTimer > 0) globalStunTimer -= dt;
+
+        Object.values(students).forEach(s => {
+            if (s.shieldTimer > 0) s.shieldTimer -= dt;
+            if (s.hintTimer > 0) s.hintTimer -= dt;
+            if (s.hintTimer <= 0 && s.autoSolveCount <= 0) s.isCheating = false;
+        });
+
+        invigilators.forEach(inv => {
+            if (!inv.active) return;
+
+            if (inv.fastTimer > 0) inv.fastTimer -= dt;
+
+            if (inv.zoneTimer > 0) {
+                inv.zoneTimer -= dt;
+                inv.zoneDesks.forEach(deskIdx => {
+                    let d = desks[deskIdx];
+                    if (d && d.occupantId) {
+                        let s = students[d.occupantId];
+                        if (s && s.isCheating && s.shieldTimer <= 0) {
+                            s.isCheating = false;
+                            s.hintTimer = 0;
+                            s.autoSolveCount = 0;
+                            s.score = Math.max(0, s.score - 3);
+                            addFloatingText(d.x + d.width / 2, d.y, '📄 TỊCH THU BÀI! (-3đ)', '#ff3333');
+                        }
+                    }
+                });
+                if (inv.zoneTimer <= 0) inv.zoneDesks = [];
+            }
+
+            if (globalStunTimer > 0) return;
+
+            let currentSpeed = inv.fastTimer > 0 ? inv.speed * 1.8 : inv.speed;
+            let dx = inv.targetX - inv.x;
+            let dy = inv.targetY - inv.y;
+            let dist = Math.hypot(dx, dy);
+
+            if (dist < 4) {
+                inv.x = inv.targetX;
+                inv.y = inv.targetY;
+                pickNextWaypoint(inv);
+            } else {
+                inv.x += (dx / dist) * currentSpeed * dt;
+                inv.y += (dy / dist) * currentSpeed * dt;
+                inv.walkCycle += dt * (inv.fastTimer > 0 ? 14 : 8);
+            }
+
+            Object.values(students).forEach(s => {
+                let desk = desks[s.deskIndex];
+                let dDist = Math.hypot(inv.x - (desk.x + desk.width / 2), inv.y - (desk.y + desk.height / 2));
+                if (dDist < 85 && s.isCheating && s.shieldTimer <= 0) {
+                    kickStudent(s.id);
+                }
+            });
+        });
+
+        visualEffects.forEach(ef => { ef.life -= dt; });
+        visualEffects = visualEffects.filter(ef => ef.life > 0);
+
+        floatingTexts.forEach(ft => {
+            ft.y -= 45 * dt;
+            ft.life -= dt;
+        });
+        floatingTexts = floatingTexts.filter(ft => ft.life > 0);
+    }
+
+    // --- HÀM VẼ NHÂN VẬT HỌC SINH ---
+    function drawStudentCharacter(s, desk) {
+        const cx = desk.x + desk.width / 2;
+        const headY = desk.y - 12;
+
+        ctx.fillStyle = s.shirtColor || '#3498db';
+        ctx.beginPath();
+        ctx.roundRect(cx - 16, desk.y - 6, 32, 16, [8, 8, 2, 2]);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.moveTo(cx - 7, desk.y - 6);
+        ctx.lineTo(cx, desk.y + 2);
+        ctx.lineTo(cx + 7, desk.y - 6);
+        ctx.fill();
+
+        ctx.fillStyle = '#f5cba7';
+        ctx.beginPath();
+        ctx.arc(cx - 12, desk.y + 7, 4, 0, Math.PI * 2);
+        ctx.arc(cx + 12, desk.y + 7, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        drawAvatar(s.avatar, s.name, cx, headY, 15, '#ffffff');
+    }
+
+    // --- HÀM VẼ NHÂN VẬT GIÁM THỊ ---
+    function drawInvigilatorCharacter(inv, index) {
+        const x = inv.x;
+        const y = inv.y;
+        const legSwing = inv.active ? Math.sin(inv.walkCycle) * 4 : 0;
+
+        if (inv.active && inv.fastTimer > 0) {
+            ctx.fillStyle = 'rgba(0, 255, 204, 0.28)';
+            ctx.beginPath();
+            ctx.ellipse(x, y + 36, 30, 13, 0, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+        ctx.beginPath();
+        ctx.ellipse(x, y + 36, 22, 9, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = '#1f2a38';
+        ctx.beginPath();
+        ctx.moveTo(x - 7, y + 14);
+        ctx.lineTo(x - 10, y + 33 + legSwing);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 7, y + 14);
+        ctx.lineTo(x + 10, y + 33 - legSwing);
+        ctx.stroke();
+
+        ctx.fillStyle = inv.suitColor;
+        ctx.beginPath();
+        ctx.roundRect(x - 16, y - 12, 32, 28, 7);
+        ctx.fill();
+        ctx.strokeStyle = '#111';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.moveTo(x - 6, y - 12);
+        ctx.lineTo(x, y + 2);
+        ctx.lineTo(x + 6, y - 12);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.fillStyle = '#d63031';
+        ctx.beginPath();
+        ctx.moveTo(x, y - 9);
+        ctx.lineTo(x - 3, y + 5);
+        ctx.lineTo(x, y + 9);
+        ctx.lineTo(x + 3, y + 5);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = inv.suitColor;
+        ctx.lineWidth = 7;
+        ctx.beginPath();
+        ctx.moveTo(x - 15, y - 8);
+        ctx.lineTo(x - 22, y + 8);
+        ctx.moveTo(x + 15, y - 8);
+        ctx.lineTo(x + 22, y + 4);
+        ctx.stroke();
+
+        ctx.fillStyle = '#f5cba7';
+        ctx.beginPath();
+        ctx.arc(x - 22, y + 9, 4, 0, Math.PI * 2);
+        ctx.arc(x + 22, y + 5, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.save();
+        ctx.translate(x + 24, y + 2);
+        ctx.rotate(-0.45);
+        ctx.fillStyle = '#f1c40f';
+        ctx.fillRect(-3, -28, 7, 36);
+        ctx.strokeStyle = '#7f6000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(-3, -28, 7, 36);
+        for (let m = -24; m < 6; m += 5) {
+            ctx.beginPath();
+            ctx.moveTo(-3, m);
+            ctx.lineTo(1, m);
+            ctx.stroke();
+        }
+        ctx.restore();
+
+        const headY = y - 28;
+        if (inv.active) {
+            drawAvatar(inv.avatar, inv.name, x, headY, 18, '#ffd700');
+        } else {
+            ctx.fillStyle = 'rgba(40, 40, 40, 0.85)';
+            ctx.beginPath();
+            ctx.arc(x, headY, 17, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#aaaaaa';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            ctx.fillStyle = '#ffd700';
+            ctx.font = 'bold 16px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('?', x, headY);
+            ctx.textBaseline = 'alphabetic';
+        }
+
+        const titleText = inv.active ? `GT${index + 1}: ${inv.name}` : `GIÁM THỊ ${index + 1} (Trống)`;
+        ctx.font = 'bold 14px Arial';
+        ctx.textAlign = 'center';
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#1b4332';
+        ctx.strokeText(titleText, x, headY - 24);
+        ctx.fillStyle = inv.active ? '#ffd166' : '#d8f3dc';
+        ctx.fillText(titleText, x, headY - 24);
+
+        if (globalStunTimer > 0 && inv.active) {
+            ctx.fillStyle = '#ff4d4d';
+            ctx.font = 'bold 14px Arial';
+            ctx.fillText(`ĐƠ: ${Math.ceil(globalStunTimer)}s`, x, headY - 42);
+        } else if (inv.active && inv.fastTimer > 0) {
+            ctx.fillStyle = '#00ffcc';
+            ctx.font = 'bold 13px Arial';
+            ctx.fillText(`⚡ x1.8 (${Math.ceil(inv.fastTimer)}s)`, x, headY - 42);
+        }
+    }
+
+    // --- VẼ TOÀN BỘ KHUNG HÌNH ---
+    function draw() {
+        ctx.clearRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+        const floorTop = 670; // Đẩy đường ranh giới sàn xuống 670px để nhường chỗ mở rộng bảng xanh
+
+        // =========================================================================
+        // 1. KHU VỰC TƯỜNG TRÊN, CỬA LỚP THẤP GỌN, BẢNG XANH LỚN CHỮ TO & BỤC GIẢNG
+        // =========================================================================
+        ctx.fillStyle = '#e6ccb2';
+        ctx.fillRect(0, 0, GAME_WIDTH, floorTop);
+
+        // Dải thông báo trên cùng
+        ctx.fillStyle = '#1f3528';
+        ctx.fillRect(0, 0, GAME_WIDTH, 40);
+        ctx.fillStyle = '#e9f5db';
+        ctx.font = 'bold 16.5px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Tặng quà >= 99 Xu (Nón phép thuật, Corgi, Kính VR) để CƯỚP QUYỀN ĐIỀU KHIỂN GIÁM THỊ 1 hoặc 2!', GAME_WIDTH / 2, 26);
+
+        // Khẩu hiệu đỏ "TIÊN HỌC LỄ - HẬU HỌC VĂN"
+        ctx.fillStyle = '#b51d14';
+        ctx.fillRect(280, 46, 540, 32);
+        ctx.strokeStyle = '#e09f3e';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(280, 46, 540, 32);
+        ctx.fillStyle = '#ffeaa7';
+        ctx.font = 'bold 18px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('TIÊN HỌC LỄ - HẬU HỌC VĂN', 550, 68);
+
+        // BẢNG XANH LỚN (Mở rộng cao 375px, rộng 962px để chữ cực to, rõ nét trên điện thoại)
+        ctx.fillStyle = '#1b4d3e';
+        ctx.beginPath();
+        ctx.roundRect(102, 84, 962, 375, 12);
+        ctx.fill();
+        ctx.strokeStyle = '#7f4f24';
+        ctx.lineWidth = 9;
+        ctx.stroke();
+
+        // Đường kẻ phân chia 2 cột trên bảng
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(572, 100);
+        ctx.lineTo(572, 445);
+        ctx.stroke();
+
+        // Cột trái: PHE HỌC SINH (Cỡ chữ lớn 20.5px dễ đọc trên màn hình điện thoại)
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#f4a261';
+        ctx.font = 'bold 23px Arial';
+        ctx.fillText('HỌC SINH - CÔNG CỤ (1 - 50 XU)', 122, 124);
+
+        ctx.font = 'bold 20.5px Arial';
+        const leftRules = [
+            ['1 xu:', 'Vào bàn / Hồi sinh lại'],
+            ['2 xu:', 'Phao nhỏ (Mở phao 35s)'],
+            ['5 xu:', 'Máy tính (+6 điểm ngay)'],
+            ['10 xu:', 'Giả ngủ (Làm đơ thầy 8s)'],
+            ['20 xu:', 'Tai nghe (Auto giải 3 câu)'],
+            ['50 xu:', 'Đổi bài (Khiên bảo vệ 25s)']
+        ];
+        leftRules.forEach((r, idx) => {
+            let ry = 172 + idx * 46;
+            ctx.fillStyle = '#ffd166';
+            ctx.fillText(r[0], 122, ry);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(r[1], 208, ry);
+        });
+
+        // Cột phải: PHE GIÁM THỊ (Cỡ chữ lớn 20.5px dễ đọc trên màn hình điện thoại)
+        ctx.fillStyle = '#90e0ef';
+        ctx.font = 'bold 23px Arial';
+        ctx.fillText('GIÁM THỊ - KỸ NĂNG (2 - 100+ XU)', 588, 124);
+
+        ctx.font = 'bold 20.5px Arial';
+        const rightRules = [
+            ['>=99:', 'Cướp quyền Giám Thị 1 - 2'],
+            ['2 xu:', 'Gõ thước (-50% TG phao)'],
+            ['5 xu:', 'Tuần tra nhanh x1.8 (15s)'],
+            ['10 xu:', 'Soi 4 bàn 30s & thu bài'],
+            ['50 xu:', 'Quét laser nón nửa phòng'],
+            ['100+:', 'Kiểm tra gắt (Đuổi toàn bộ)']
+        ];
+        rightRules.forEach((r, idx) => {
+            let ry = 172 + idx * 46;
+            ctx.fillStyle = '#ffd166';
+            ctx.fillText(r[0], 588, ry);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(r[1], 675, ry);
+        });
+
+        // Dòng nhắc nhở ngay dưới bảng xanh
+        ctx.font = 'bold 17.5px Arial';
+        ctx.textAlign = 'center';
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#2b190e';
+        ctx.strokeText('Giám thị là người chơi thật điều khiển - Chưa có người nhận, Giám thị đứng yên', 580, 492);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Giám thị là người chơi thật điều khiển - Chưa có người nhận, Giám thị đứng yên', 580, 492);
+
+        // CỬA LỚP BÊN TRÁI (Đã hạ thấp xuống, gọn gàng, không cao bằng bảng)
+        ctx.fillStyle = '#f8f9fa';
+        ctx.strokeStyle = '#6c757d';
+        ctx.lineWidth = 2;
+        ctx.fillRect(8, 392, 84, 28);
+        ctx.strokeRect(8, 392, 84, 28);
+        ctx.fillStyle = '#1b4332';
+        ctx.font = 'bold 14px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('CỬA LỚP', 50, 411);
+
+        // Khung cửa gỗ thấp (cao 240px chạm sát mép sàn 670)
+        ctx.fillStyle = '#6f3b18';
+        ctx.fillRect(6, 426, 88, 244);
+        ctx.fillStyle = '#8d4f25';
+        ctx.fillRect(13, 434, 74, 236);
+        // Cửa sổ kính xanh nhỏ gọn trên cánh cửa
+        ctx.fillStyle = '#90e0ef';
+        ctx.fillRect(21, 448, 58, 92);
+        ctx.strokeStyle = '#5c2f12';
+        ctx.lineWidth = 3.5;
+        ctx.strokeRect(21, 448, 58, 92);
+        ctx.beginPath();
+        ctx.moveTo(50, 448); ctx.lineTo(50, 540);
+        ctx.moveTo(21, 494); ctx.lineTo(79, 494);
+        ctx.stroke();
+        // Tay nắm cửa tròn
+        ctx.fillStyle = '#ffd166';
+        ctx.beginPath();
+        ctx.arc(74, 565, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Kệ sách nhỏ gọn đặt cạnh cửa lớp
+        ctx.fillStyle = '#7f4f24';
+        ctx.fillRect(102, 530, 56, 140);
+        ctx.fillStyle = '#582f0e';
+        ctx.fillRect(107, 538, 46, 38);
+        ctx.fillRect(107, 582, 46, 38);
+        ctx.fillRect(107, 626, 46, 36);
+        const bookColors = ['#e63946', '#4cc9f0', '#ffbe0b', '#80ed99', '#f72585'];
+        for (let b = 0; b < 5; b++) {
+            ctx.fillStyle = bookColors[b];
+            ctx.fillRect(110 + b * 8, 544, 6, 30);
+            ctx.fillRect(110 + ((b + 2) % 5) * 8, 588, 6, 30);
+        }
+
+        // =========================================================================
+        // Ô MÀU GHI TÊN 2 GIÁM THỊ & BỤC GIẢNG (KÉO DÀI Ô MÀU & DỊCH SANG PHẢI)
+        // =========================================================================
+        // Hàm cắt chữ theo chiều rộng pixel thực tế để tên không bao giờ tràn khỏi ô màu
+        function fitTextToWidth(text, maxWidth) {
+            if (ctx.measureText(text).width <= maxWidth) return text;
+            let trimmed = text;
+            while (trimmed.length > 0 && ctx.measureText(trimmed + '…').width > maxWidth) {
+                trimmed = trimmed.slice(0, -1);
+            }
+            return trimmed + '…';
+        }
+
+        // 1. Ô màu Giám thị 1 (Mở rộng chiều dài lên 315px: từ X=175 đến X=490)
+        const box1X = 175, box1Y = 528, boxW = 315, boxH = 104;
+        ctx.fillStyle = 'rgba(27, 67, 50, 0.94)';
+        ctx.beginPath();
+        ctx.roundRect(box1X, box1Y, boxW, boxH, 14);
+        ctx.fill();
+        ctx.strokeStyle = invigilators[0].active ? '#ffd700' : '#7f4f24';
+        ctx.lineWidth = 3.5;
+        ctx.stroke();
+
+        drawAvatar(invigilators[0].avatar, invigilators[0].name, box1X + 44, box1Y + 52, 32, invigilators[0].active ? '#ffd700' : '#888');
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#90e0ef';
+        ctx.font = 'bold 15px Arial';
+        ctx.fillText('GIÁM THỊ 1 (Bục giảng)', box1X + 88, box1Y + 32);
+
+        ctx.fillStyle = invigilators[0].active ? '#ffd166' : '#cccccc';
+        ctx.font = 'bold 17px Arial';
+        let gt1Display = fitTextToWidth(invigilators[0].name, boxW - 100);
+        ctx.fillText(gt1Display, box1X + 88, box1Y + 58);
+
+        ctx.fillStyle = '#a3e635';
+        ctx.font = 'bold 13.5px Arial';
+        ctx.fillText(invigilators[0].active ? '🟢 Đang điều khiển' : '⚪ Tặng >=99 xu nhận', box1X + 88, box1Y + 84);
+
+        // 2. Bục giảng gỗ (Đã dịch sang phải, tâm tại X=618)
+        ctx.fillStyle = '#a46028';
+        ctx.beginPath();
+        ctx.moveTo(548, 522);
+        ctx.lineTo(688, 522);
+        ctx.lineTo(708, 622);
+        ctx.lineTo(528, 622);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#6f3b18';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+
+        ctx.fillStyle = '#7f471c';
+        ctx.fillRect(528, 622, 180, 22);
+        ctx.fillStyle = '#fff3b0';
+        ctx.font = 'bold 19px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('BỤC GIẢNG', 618, 584);
+
+        // 3. Ô màu Giám thị 2 (Mở rộng chiều dài lên 315px và dịch sang phải: từ X=745 đến X=1060)
+        const box2X = 745, box2Y = 528;
+        ctx.fillStyle = 'rgba(21, 101, 192, 0.94)';
+        ctx.beginPath();
+        ctx.roundRect(box2X, box2Y, boxW, boxH, 14);
+        ctx.fill();
+        ctx.strokeStyle = invigilators[1].active ? '#ffd700' : '#7f4f24';
+        ctx.lineWidth = 3.5;
+        ctx.stroke();
+
+        drawAvatar(invigilators[1].avatar, invigilators[1].name, box2X + 44, box2Y + 52, 32, invigilators[1].active ? '#ffd700' : '#888');
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#90e0ef';
+        ctx.font = 'bold 15px Arial';
+        ctx.fillText('GIÁM THỊ 2 (Bục giảng)', box2X + 88, box2Y + 32);
+
+        ctx.fillStyle = invigilators[1].active ? '#ffd166' : '#cccccc';
+        ctx.font = 'bold 17px Arial';
+        let gt2Display = fitTextToWidth(invigilators[1].name, boxW - 100);
+        ctx.fillText(gt2Display, box2X + 88, box2Y + 58);
+
+        ctx.fillStyle = '#a3e635';
+        ctx.font = 'bold 13.5px Arial';
+        ctx.fillText(invigilators[1].active ? '🟢 Đang điều khiển' : '⚪ Tặng >=99 xu nhận', box2X + 88, box2Y + 84);
+
+        // =========================================================================
+        // 2. SÀN GẠCH GỖ SO LE & 2 LỐI ĐI THẢM DỌC
+        // =========================================================================
+        ctx.fillStyle = '#d3b37b';
+        ctx.fillRect(0, floorTop, GAME_WIDTH, GAME_HEIGHT - floorTop);
+
+        const tileH = 28;
+        const tileW = 135;
+        ctx.strokeStyle = '#b6945b';
+        ctx.lineWidth = 1.5;
+
+        for (let y = floorTop, rowIdx = 0; y < GAME_HEIGHT; y += tileH, rowIdx++) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(GAME_WIDTH, y);
+            ctx.stroke();
+
+            let offset = (rowIdx % 2) * (tileW / 2);
+            for (let x = offset; x < GAME_WIDTH; x += tileW) {
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+                ctx.lineTo(x, y + tileH);
+                ctx.stroke();
+            }
+        }
+
+        ctx.fillStyle = 'rgba(181, 101, 59, 0.38)';
+        ctx.fillRect(288, floorTop, 56, GAME_HEIGHT - floorTop);
+        ctx.fillRect(720, floorTop, 56, GAME_HEIGHT - floorTop);
+        ctx.strokeStyle = 'rgba(140, 70, 35, 0.45)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(288, floorTop, 56, GAME_HEIGHT - floorTop);
+        ctx.strokeRect(720, floorTop, 56, GAME_HEIGHT - floorTop);
+
+        fanAngle += 0.025;
+        function drawFanShadow(fx, fy) {
+            ctx.save();
+            ctx.translate(fx, fy);
+            ctx.rotate(fanAngle);
+            ctx.fillStyle = 'rgba(60, 40, 20, 0.14)';
+            for (let i = 0; i < 4; i++) {
+                ctx.rotate(Math.PI / 2);
+                ctx.beginPath();
+                ctx.ellipse(0, 75, 18, 80, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.beginPath();
+            ctx.arc(0, 0, 22, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+        drawFanShadow(245, 1050);
+        drawFanShadow(745, 1050);
+
+        // =========================================================================
+        // 3. VẼ 100 BÀN HỌC, HIỆU ỨNG SOI SÁNG 4 BÀN & HỌC SINH
+        // =========================================================================
+        desks.forEach((desk, index) => {
+            const cx = desk.x + desk.width / 2;
+
+            const isSpotlit = invigilators.some(inv => inv.active && inv.zoneTimer > 0 && inv.zoneDesks.includes(index));
+            if (isSpotlit) {
+                ctx.save();
+                ctx.fillStyle = 'rgba(255, 235, 59, 0.35)';
+                ctx.beginPath();
+                ctx.roundRect(desk.x - 10, desk.y - 24, desk.width + 20, desk.height + 46, 12);
+                ctx.fill();
+                ctx.strokeStyle = '#ffeb3b';
+                ctx.lineWidth = 2.5;
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // 1. Lưng ghế gỗ
+            const chairW = 36, chairH = 22;
+            const chairX = cx - chairW / 2;
+            const chairY = desk.y - 15;
+
+            ctx.fillStyle = '#7f4f24';
+            ctx.beginPath();
+            ctx.roundRect(chairX, chairY, chairW, chairH, [6, 6, 2, 2]);
+            ctx.fill();
+            ctx.strokeStyle = '#4a2c11';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            // 2. Học sinh ngồi ghế
+            if (desk.occupantId) {
+                let s = students[desk.occupantId];
+                drawStudentCharacter(s, desk);
+            }
+
+            // 3. Bóng đổ bàn
+            ctx.fillStyle = 'rgba(45, 25, 10, 0.28)';
+            ctx.beginPath();
+            ctx.roundRect(desk.x + 2, desk.y + 7, desk.width, desk.height, 8);
+            ctx.fill();
+
+            // 4. Mặt bàn gỗ 2 lớp
+            ctx.fillStyle = '#9c6634';
+            ctx.beginPath();
+            ctx.roundRect(desk.x, desk.y + 3, desk.width, desk.height, 7);
+            ctx.fill();
+            ctx.strokeStyle = '#5c3818';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            ctx.fillStyle = '#c88a4b';
+            ctx.beginPath();
+            ctx.roundRect(desk.x + 2, desk.y, desk.width - 4, desk.height - 5, 6);
+            ctx.fill();
+
+            // 5. Bảng tên & trạng thái học sinh
+            if (desk.occupantId) {
+                let s = students[desk.occupantId];
+
+                let shortName = s.name.length > 9 ? s.name.substring(0, 8) + '…' : s.name;
+                ctx.font = 'bold 11px Arial';
+                let textW = Math.max(46, ctx.measureText(shortName).width + 10);
+
+                ctx.fillStyle = 'rgba(20, 20, 20, 0.78)';
+                ctx.beginPath();
+                ctx.roundRect(cx - textW / 2, desk.y + desk.height + 3, textW, 16, 4);
+                ctx.fill();
+
+                ctx.fillStyle = '#ffffff';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(shortName, cx, desk.y + desk.height + 11);
+                ctx.textBaseline = 'alphabetic';
+
+                if (s.score > 0) {
+                    ctx.fillStyle = '#ffd700';
+                    ctx.font = 'bold 10px Arial';
+                    ctx.fillText(`${s.score}đ`, cx, desk.y + desk.height + 29);
+                }
+
+                if (s.shieldTimer > 0) {
+                    ctx.beginPath();
+                    ctx.arc(cx, desk.y - 4, 28, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(0, 255, 255, 0.22)';
+                    ctx.fill();
+                    ctx.strokeStyle = '#00ffff';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                if (s.isCheating) {
+                    ctx.font = 'bold 11px Arial';
+                    ctx.fillStyle = '#ffeb3b';
+                    ctx.fillText(s.hintTimer > 0 ? `📖${Math.ceil(s.hintTimer)}s` : '⚡', cx + 24, desk.y - 16);
+                }
+            }
+        });
+
+        // =========================================================================
+        // 4. HIỆU ỨNG KỸ NĂNG ĐẶC BIỆT CỦA GIÁM THỊ
+        // =========================================================================
+        visualEffects.forEach(ef => {
+            ctx.save();
+            let alpha = Math.max(0, ef.life / ef.maxLife);
+
+            if (ef.type === 'ruler_strike') {
+                ctx.strokeStyle = `rgba(255, 159, 67, ${alpha})`;
+                ctx.lineWidth = 5;
+                ctx.setLineDash([8, 6]);
+                ctx.beginPath();
+                ctx.moveTo(ef.x1, ef.y1);
+                ctx.lineTo(ef.x2, ef.y2);
+                ctx.stroke();
+
+                ctx.fillStyle = `rgba(255, 71, 87, ${alpha})`;
+                ctx.beginPath();
+                ctx.arc(ef.x2, ef.y2, 28 * (1.2 - alpha * 0.5), 0, Math.PI * 2);
+                ctx.fill();
+            } else if (ef.type === 'laser_cone') {
+                let minX = ef.side === 'left' ? 0 : GAME_WIDTH / 2;
+                let maxX = ef.side === 'left' ? GAME_WIDTH / 2 : GAME_WIDTH;
+
+                let grad = ctx.createLinearGradient(ef.x, ef.y, (minX + maxX) / 2, GAME_HEIGHT);
+                grad.addColorStop(0, `rgba(255, 0, 55, ${0.65 * alpha})`);
+                grad.addColorStop(1, `rgba(255, 0, 55, ${0.15 * alpha})`);
+
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.moveTo(ef.x, ef.y);
+                ctx.lineTo(minX, floorTop);
+                ctx.lineTo(minX, GAME_HEIGHT);
+                ctx.lineTo(maxX, GAME_HEIGHT);
+                ctx.lineTo(maxX, floorTop);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.strokeStyle = `rgba(255, 50, 50, ${alpha})`;
+                ctx.lineWidth = 4;
+                ctx.stroke();
+            } else if (ef.type === 'strict_inspection') {
+                ctx.fillStyle = `rgba(220, 20, 60, ${0.28 * alpha})`;
+                ctx.fillRect(0, floorTop, GAME_WIDTH, GAME_HEIGHT - floorTop);
+            }
+            ctx.restore();
+        });
+
+        invigilators.forEach((inv, index) => {
+            drawInvigilatorCharacter(inv, index);
+        });
+
+        // =========================================================================
+        // 5. DÃY CÂU HỎI TOÁN (CHỮ TRẮNG IN ĐẬM VIỀN ĐEN, ĐẾM GIỜ SÁT DẤU HỎI)
+        // =========================================================================
+        const mathY = 1300;
+        ctx.font = '900 48px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        const mathText = mathProblem.text;
+        const textWidth = ctx.measureText(mathText).width;
+        const mathCenterX = GAME_WIDTH / 2 - 35;
+
+        ctx.save();
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+        ctx.shadowBlur = 6;
+        ctx.shadowOffsetY = 3;
+
+        ctx.lineWidth = 9;
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = '#111111';
+        ctx.strokeText(mathText, mathCenterX, mathY);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(mathText, mathCenterX, mathY);
+        ctx.restore();
+
+        const badgeX = mathCenterX + textWidth / 2 + 48;
+        const badgeY = mathY;
+        const badgeW = 68, badgeH = 42;
+
+        ctx.save();
+        ctx.fillStyle = '#e63956';
+        ctx.beginPath();
+        ctx.roundRect(badgeX - badgeW / 2, badgeY - badgeH / 2, badgeW, badgeH, 21);
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 24px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${Math.ceil(mathProblem.timeLeft)}s`, badgeX, badgeY + 1);
+        ctx.restore();
+
+        // =========================================================================
+        // 6. HIỆU ỨNG CHỮ BAY (FLOATING TEXTS)
+        // =========================================================================
+        ctx.textBaseline = 'alphabetic';
+        floatingTexts.forEach(ft => {
+            ctx.save();
+            ctx.font = 'bold 22px Arial';
+            ctx.textAlign = 'center';
+            ctx.globalAlpha = Math.max(0, ft.life / 2);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#000000';
+            ctx.strokeText(ft.text, ft.x, ft.y);
+            ctx.fillStyle = ft.color;
+            ctx.fillText(ft.text, ft.x, ft.y);
+            ctx.restore();
+        });
+    }
+
+    function gameLoop() {
+        let now = Date.now();
+        let dt = (now - lastTime) / 1000;
+        lastTime = now;
+
+        update(dt);
+        draw();
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    gameLoop();
+</script>
+</body>
+</html>
